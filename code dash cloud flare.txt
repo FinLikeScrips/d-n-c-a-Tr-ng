@@ -1,0 +1,646 @@
+const HTML_PAGE = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Trợ lý ảo Gemini (Multi-Key + Keep-Alive)</title>
+  <script src="https://www.youtube.com/iframe_api"></script>
+</head>
+<body style="font-family: sans-serif; padding: 20px; line-height: 1.6; max-width: 680px;">
+  <h3>Trợ lý ảo Gemini (Giá vàng + Nhạc YouTube + Truyện Audio)</h3>
+  <button id="startBtn">Bắt đầu nói chuyện</button>
+  <button id="stopBtn" disabled>Dừng tất cả</button>
+  <p id="status">Trạng thái: Chưa kết nối</p>
+  <p>
+    Âm lượng Mic: <progress id="vol" value="0" max="100"></progress> |
+    Mic: <b id="gateStatus">Im lặng</b> |
+    Ngưỡng lọc: <input id="threshSlider" type="range" min="0" max="15" value="2" />
+    <span id="threshVal">0.02</span>
+  </p>
+
+  <div style="margin: 15px 0; padding: 12px; background: #eef6ff; border: 1px solid #99c2ff;">
+    <b>Đang phát:</b> <span id="nowPlaying">Chưa phát</span>
+    <span id="timerInfo" style="color: #d9534f; margin-left: 8px; font-weight: bold;"></span>
+    <div id="directLinkWrap" style="margin-top: 4px; font-size: 13px; display: none;">
+      <a id="directLink" href="#" target="_blank">Mở trực tiếp trên YouTube</a>
+    </div>
+    <div id="ytWrap" style="margin-top: 10px; display: none;">
+      <div id="ytPlayerBox"></div>
+    </div>
+  </div>
+
+  <pre id="logBox" style="background:#f4f4f4; padding:10px; height:160px; overflow:auto; border:1px solid #ccc;"></pre>
+
+  <script>
+    let ws, recCtx, playCtx, stream, processor;
+    let nextPlayTime = 0, lastVoiceTime = 0, lastPacketSentTime = 0, sleepTimer = null;
+    let silencePacketsLeft = 0;
+    let userStopped = true;
+    let ytPlayer = null;
+    let currentCandidates = [];
+    let currentIdx = 0;
+    let currentMode = "music";
+
+    const statusEl = document.getElementById("status");
+    const gateStatusEl = document.getElementById("gateStatus");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const volEl = document.getElementById("vol");
+    const threshSlider = document.getElementById("threshSlider");
+    const threshVal = document.getElementById("threshVal");
+    const logBox = document.getElementById("logBox");
+    const ytWrap = document.getElementById("ytWrap");
+    const nowPlaying = document.getElementById("nowPlaying");
+    const timerInfo = document.getElementById("timerInfo");
+    const directLinkWrap = document.getElementById("directLinkWrap");
+    const directLink = document.getElementById("directLink");
+
+    function addLog(msg) {
+      logBox.textContent += msg + "\\n";
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function playCandidate(idx) {
+      if (idx >= currentCandidates.length) {
+        addLog("⚠ Tất cả các bản tìm được đều bị chủ kênh chặn nhúng.");
+        return;
+      }
+      currentIdx = idx;
+      const item = currentCandidates[idx];
+      nowPlaying.textContent = (currentMode === "story" ? "Truyện: " : "Nhạc: ") + item.title;
+      directLink.href = "https://www.youtube.com/watch?v=" + item.videoId;
+      directLinkWrap.style.display = "block";
+      ytWrap.style.display = "block";
+      addLog("▶ Đang phát (" + item.videoId + "): " + item.title);
+
+      if (window.YT && window.YT.Player) {
+        if (ytPlayer && typeof ytPlayer.loadVideoById === "function") {
+          ytPlayer.loadVideoById(item.videoId);
+        } else {
+          ytPlayer = new YT.Player("ytPlayerBox", {
+            height: "240",
+            width: "100%",
+            videoId: item.videoId,
+            playerVars: {
+              autoplay: 1,
+              playsinline: 1,
+              origin: location.origin
+            },
+            events: {
+              onReady: function (e) {
+                e.target.playVideo();
+              },
+              onError: function (e) {
+                addLog("⚠ Video lỗi/chặn nhúng (Mã " + e.data + "), đang tự đổi sang bản khác...");
+                playCandidate(currentIdx + 1);
+              }
+            }
+          });
+        }
+      } else {
+        document.getElementById("ytPlayerBox").innerHTML =
+          '<iframe width="100%" height="240" frameborder="0" referrerpolicy="strict-origin-when-cross-origin" allow="autoplay; encrypted-media" allowfullscreen src="https://www.youtube.com/embed/' +
+          item.videoId + '?autoplay=1&origin=' + encodeURIComponent(location.origin) + '"></iframe>';
+      }
+    }
+
+    function stopYouTube() {
+      if (ytPlayer && typeof ytPlayer.stopVideo === "function") {
+        ytPlayer.stopVideo();
+      }
+      ytWrap.style.display = "none";
+      directLinkWrap.style.display = "none";
+      nowPlaying.textContent = "Đã dừng";
+      timerInfo.textContent = "";
+      if (sleepTimer) {
+        clearTimeout(sleepTimer);
+        sleepTimer = null;
+      }
+    }
+
+    threshSlider.oninput = function () {
+      threshVal.textContent = (threshSlider.value / 100).toFixed(2);
+    };
+
+    function connectWebSocket() {
+      if (userStopped) return;
+      const wsUrl = location.origin.replace(/^http/, "ws") + "/";
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = function () {
+        statusEl.textContent = "Đã kết nối! (Nhạc vẫn phát độc lập kể cả khi im lặng lâu)";
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        nextPlayTime = playCtx.currentTime;
+        silencePacketsLeft = 0;
+        lastPacketSentTime = Date.now();
+      };
+
+      ws.onmessage = function (event) {
+        if (typeof event.data === "string") {
+          try {
+            const cmd = JSON.parse(event.data);
+            if (cmd.type === "PLAY_YOUTUBE") {
+              if (sleepTimer) clearTimeout(sleepTimer);
+              currentMode = cmd.mode || "music";
+              currentCandidates = cmd.candidates || [{ videoId: cmd.videoId, title: cmd.title }];
+              playCandidate(0);
+
+              if (cmd.sleepMinutes > 0) {
+                timerInfo.textContent = "(Tự tắt sau " + cmd.sleepMinutes + " phút)";
+                sleepTimer = setTimeout(function () {
+                  stopYouTube();
+                  addLog("Đã tự động tắt truyện theo hẹn giờ.");
+                }, cmd.sleepMinutes * 60 * 1000);
+              } else {
+                timerInfo.textContent = "";
+              }
+              return;
+            }
+            if (cmd.type === "STOP_MEDIA") {
+              stopYouTube();
+              addLog("⏹ Đã tắt nhạc/truyện.");
+              return;
+            }
+          } catch (_) {}
+          addLog(event.data);
+          return;
+        }
+
+        if (!(event.data instanceof ArrayBuffer)) return;
+        const int16 = new Int16Array(event.data);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+        const buffer = playCtx.createBuffer(1, float32.length, 24000);
+        buffer.getChannelData(0).set(float32);
+
+        const src = playCtx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(playCtx.destination);
+        const startTime = Math.max(playCtx.currentTime, nextPlayTime);
+        src.start(startTime);
+        nextPlayTime = startTime + buffer.duration;
+      };
+
+      ws.onclose = function (e) {
+        if (!userStopped) {
+          statusEl.textContent = "Đang tự động làm mới phiên kết nối (Nhạc vẫn phát bình thường)...";
+          setTimeout(connectWebSocket, 1500);
+        } else {
+          statusEl.textContent = "Đã dừng kết nối.";
+        }
+      };
+    }
+
+    startBtn.onclick = async function () {
+      logBox.textContent = "";
+      userStopped = false;
+      try {
+        recCtx = new AudioContext({ sampleRate: 16000 });
+        playCtx = new AudioContext({ sampleRate: 24000 });
+        await recCtx.resume();
+        await playCtx.resume();
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true },
+        });
+      } catch (err) {
+        statusEl.textContent = "Lỗi không mở được Micro: " + err.message;
+        return;
+      }
+
+      const source = recCtx.createMediaStreamSource(stream);
+      processor = recCtx.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = function (e) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const float32 = e.inputBuffer.getChannelData(0);
+        let sum = 0;
+        for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+        const rms = Math.sqrt(sum / float32.length);
+        volEl.value = Math.min(100, Math.round(rms * 300));
+
+        const threshold = threshSlider.value / 100;
+        const now = Date.now();
+        if (threshold === 0 || rms >= threshold) {
+          lastVoiceTime = now;
+          silencePacketsLeft = 5;
+        }
+
+        if (threshold === 0 || now - lastVoiceTime <= 600) {
+          gateStatusEl.textContent = "Đang thu";
+          gateStatusEl.style.color = "green";
+          const int16 = new Int16Array(float32.length);
+          for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]));
+            int16[i] = s < 0 ? s * 32768 : s * 32767;
+          }
+          ws.send(int16.buffer);
+          lastPacketSentTime = now;
+        } else if (silencePacketsLeft > 0) {
+          silencePacketsLeft--;
+          gateStatusEl.textContent = "Đang chờ bot...";
+          gateStatusEl.style.color = "#d9822b";
+          ws.send(new Int16Array(float32.length).buffer);
+          lastPacketSentTime = now;
+        } else if (now - lastPacketSentTime >= 25000) {
+          // Cứ mỗi 25 giây im lặng, gửi 1 gói rỗng nhỏ để giữ kết nối không bị lỗi 1008 inactivity
+          ws.send(new Int16Array(1600).buffer);
+          lastPacketSentTime = now;
+          gateStatusEl.textContent = "Im lặng (Đã giữ kết nối)";
+          gateStatusEl.style.color = "gray";
+        } else {
+          gateStatusEl.textContent = "Im lặng (Tiết kiệm quota)";
+          gateStatusEl.style.color = "gray";
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(recCtx.destination);
+
+      connectWebSocket();
+    };
+
+    stopBtn.onclick = function () {
+      userStopped = true;
+      if (ws) ws.close();
+      stopYouTube();
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      volEl.value = 0;
+      if (processor) processor.disconnect();
+      if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+      if (recCtx && recCtx.state !== "closed") recCtx.close();
+      if (playCtx && playCtx.state !== "closed") playCtx.close();
+    };
+  </script>
+</body>
+</html>`;
+
+export default {
+  async fetch(request, env) {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response(HTML_PAGE, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, espSocket] = Object.values(pair);
+    espSocket.accept();
+
+    const keys = (env.GEMINI_API_KEY || "")
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean);
+
+    for (let i = keys.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
+
+    const MODEL = env.GEMINI_MODEL || "models/gemini-3.8-live";
+    let geminiSocket = null;
+    let usedKeyIndex = -1;
+
+    for (let i = 0; i < keys.length; i++) {
+      const tryUrl = `https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${keys[i]}`;
+      try {
+        const geminiResp = await fetch(tryUrl, {
+          headers: { Upgrade: "websocket" },
+        });
+        if (geminiResp.webSocket) {
+          geminiSocket = geminiResp.webSocket;
+          usedKeyIndex = i + 1;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    if (!geminiSocket) {
+      espSocket.close(1011, "All API keys exhausted or failed");
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    geminiSocket.accept();
+    espSocket.send(`LOG: 🔑 Đã kết nối bằng API Key #${usedKeyIndex}/${keys.length}`);
+
+    geminiSocket.send(
+      JSON.stringify({
+        setup: {
+          model: MODEL,
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
+            },
+          },
+          systemInstruction: {
+            parts: [
+              {
+                text:
+                  "Bạn là trợ lý ảo thông minh chạy trên ESP32, trả lời ngắn gọn, tự nhiên bằng tiếng Việt. " +
+                  "1. Khi người dùng hỏi giá vàng hôm nay, giá vàng SJC hay vàng nhẫn 9999 -> BẮT BUỘC gọi công cụ get_gold_price, không tự nói là không truy cập được. " +
+                  "2. Khi người dùng muốn nghe nhạc: KHÔNG tìm từ khóa chung chung. Tự chọn TÊN BÀI HÁT CỤ THỂ + CA SĨ hợp tâm trạng, luôn thêm chữ 'lyric video' vào cuối từ khóa rồi gọi play_youtube_music. Nếu đòi đổi bài, chọn bài khác hẳn. " +
+                  "3. Khi muốn nghe truyện audio dài, truyện ma, kiếm hiệp, sách nói -> gọi play_audio_story. " +
+                  "4. Khi muốn tắt nhạc/truyện -> gọi stop_media.",
+              },
+            ],
+          },
+          tools: [
+            {
+              functionDeclarations: [
+                {
+                  name: "get_gold_price",
+                  description: "Lấy trực tiếp giá vàng SJC và vàng nhẫn 9999 hôm nay tại Việt Nam theo giờ Việt Nam.",
+                  parameters: { type: "OBJECT", properties: {} },
+                },
+                {
+                  name: "play_youtube_music",
+                  description: "Tìm và phát một bài hát cụ thể trên YouTube.",
+                  parameters: {
+                    type: "OBJECT",
+                    properties: {
+                      query: {
+                        type: "STRING",
+                        description: "Tên bài hát cụ thể + ca sĩ + 'lyric video'.",
+                      },
+                      is_random_mood: {
+                        type: "BOOLEAN",
+                        description: "true nếu người dùng chỉ nói tâm trạng/ngẫu nhiên, false nếu gọi đúng tên bài.",
+                      },
+                    },
+                    required: ["query"],
+                  },
+                },
+                {
+                  name: "play_audio_story",
+                  description: "Tìm và phát truyện audio dài hoặc sách nói trên YouTube, có hẹn giờ tắt.",
+                  parameters: {
+                    type: "OBJECT",
+                    properties: {
+                      query: {
+                        type: "STRING",
+                        description: "Tên truyện cụ thể hoặc tác giả + 'truyện audio full'.",
+                      },
+                      sleep_minutes: {
+                        type: "NUMBER",
+                        description: "Số phút tự tắt (mặc định 45).",
+                      },
+                    },
+                    required: ["query"],
+                  },
+                },
+                {
+                  name: "stop_media",
+                  description: "Dừng nhạc hoặc truyện audio đang phát.",
+                  parameters: { type: "OBJECT", properties: {} },
+                },
+              ],
+            },
+          ],
+        },
+      })
+    );
+
+    const decoder = new TextDecoder();
+
+    async function fetchVietnamGoldPrice() {
+      const vnTime = new Date().toLocaleString("vi-VN", {
+        timeZone: "Asia/Ho_Chi_Minh",
+        hour12: false,
+      });
+
+      try {
+        const res = await fetch("https://sjc.com.vn/xml/tygiavang.xml", {
+          headers: { "User-Agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(4500),
+          cf: { cacheTtl: 180 },
+        });
+        if (res.ok) {
+          const xml = await res.text();
+          const items = [];
+          const regex = /<item\s+buy="([^"]+)"\s+sell="([^"]+)"\s+type="([^"]+)"/g;
+          let m;
+          while ((m = regex.exec(xml)) !== null) {
+            const [, buy, sell, type] = m;
+            if (
+              type.includes("SJC 1L") ||
+              type.includes("Nhẫn SJC 99,99") ||
+              type.includes("Vàng miếng SJC")
+            ) {
+              items.push(`${type}: mua vào ${buy} triệu/lượng, bán ra ${sell} triệu/lượng`);
+            }
+            if (items.length >= 2) break;
+          }
+          if (items.length > 0) {
+            return `Giờ Việt Nam: ${vnTime}. Giá vàng SJC cập nhật: ${items.join("; ")}.`;
+          }
+        }
+      } catch (_) {}
+
+      try {
+        const res = await fetch("https://giavang.org/", {
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+          signal: AbortSignal.timeout(4500),
+          cf: { cacheTtl: 180 },
+        });
+        if (res.ok) {
+          const html = await res.text();
+          const sjcMatch = html.match(/SJC[\s\S]{0,400}?(\d{2,3}\.\d{3})[\s\S]{0,150}?(\d{2,3}\.\d{3})/);
+          if (sjcMatch) {
+            return `Giờ Việt Nam: ${vnTime}. Giá vàng SJC tham khảo: mua vào ${sjcMatch[1]} triệu/lượng, bán ra ${sjcMatch[2]} triệu/lượng.`;
+          }
+        }
+      } catch (_) {}
+
+      return `Hiện tại là ${vnTime} giờ Việt Nam. Tạm thời nguồn bảng giá vàng trực tuyến đang bảo trì.`;
+    }
+
+    async function searchYouTubeCandidates(query, isLongStory = false, shuffle = false) {
+      const searchQ = isLongStory ? `${query} audio full` : query;
+      let candidates = [];
+
+      if (env.YOUTUBE_API_KEY) {
+        const durationParam = isLongStory ? "&videoDuration=long" : "";
+        const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=5${durationParam}&q=${encodeURIComponent(searchQ)}&key=${env.YOUTUBE_API_KEY}`;
+        const res = await fetch(apiUrl);
+        const data = await res.json();
+        candidates = (data.items || []).map((it) => ({
+          videoId: it.id.videoId,
+          title: it.snippet.title,
+        }));
+      } else {
+        const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchQ)}`;
+        const res = await fetch(ytUrl, {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "vi-VN,vi;q=0.9",
+          },
+        });
+        const html = await res.text();
+        const regex = /"videoRenderer":\{"videoId":"([a-zA-Z0-9_-]{11})".*?"title":\{"runs":\[\{"text":"([^"]+)"/g;
+        const seen = new Set();
+        let match;
+        while ((match = regex.exec(html)) !== null && candidates.length < 5) {
+          if (seen.has(match[1])) continue;
+          seen.add(match[1]);
+          const title = match[2].replace(/\\u0026/g, "&").replace(/\\"/g, '"');
+          candidates.push({ videoId: match[1], title });
+        }
+      }
+
+      if (shuffle && candidates.length > 1) {
+        const firstIdx = Math.floor(Math.random() * candidates.length);
+        const [picked] = candidates.splice(firstIdx, 1);
+        candidates.unshift(picked);
+      }
+      return candidates;
+    }
+
+    espSocket.addEventListener("message", async (event) => {
+      let arrayBuffer = null;
+      if (event.data instanceof ArrayBuffer) {
+        arrayBuffer = event.data;
+      } else if (event.data instanceof Blob) {
+        arrayBuffer = await event.data.arrayBuffer();
+      }
+
+      if (arrayBuffer && arrayBuffer.byteLength > 0) {
+        const bytes = new Uint8Array(arrayBuffer);
+        let binary = "";
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        geminiSocket.send(
+          JSON.stringify({
+            realtimeInput: {
+              audio: {
+                mimeType: "audio/pcm;rate=16000",
+                data: btoa(binary),
+              },
+            },
+          })
+        );
+      }
+    });
+
+    geminiSocket.addEventListener("message", async (event) => {
+      try {
+        let text;
+        if (event.data instanceof Blob) {
+          text = await event.data.text();
+        } else if (event.data instanceof ArrayBuffer) {
+          text = decoder.decode(event.data);
+        } else {
+          text = event.data;
+        }
+
+        const data = JSON.parse(text);
+
+        if (data.toolCall?.functionCalls) {
+          const functionResponses = [];
+
+          for (const call of data.toolCall.functionCalls) {
+            if (call.name === "get_gold_price") {
+              const info = await fetchVietnamGoldPrice();
+              espSocket.send("LOG: " + info);
+              functionResponses.push({
+                id: call.id,
+                name: call.name,
+                response: { result: info },
+              });
+            } else if (call.name === "play_youtube_music") {
+              const query = call.args?.query || "Lofi chill Việt Nam lyric video";
+              const isRandom = Boolean(call.args?.is_random_mood);
+              const candidates = await searchYouTubeCandidates(query, false, isRandom);
+              if (candidates.length > 0) {
+                espSocket.send(
+                  JSON.stringify({
+                    type: "PLAY_YOUTUBE",
+                    mode: "music",
+                    candidates,
+                    sleepMinutes: 0,
+                  })
+                );
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: {
+                    result: `Đang phát trên YouTube: "${candidates[0].title}". Giới thiệu ngắn tên bài này cho người dùng.`,
+                  },
+                });
+              } else {
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: { result: `Không tìm thấy bài hát phù hợp cho ${query}.` },
+                });
+              }
+            } else if (call.name === "play_audio_story") {
+              const query = call.args?.query || "truyện ma Nguyễn Ngọc Ngạn";
+              const sleepMinutes = Number(call.args?.sleep_minutes) || 45;
+              const candidates = await searchYouTubeCandidates(query, true, false);
+              if (candidates.length > 0) {
+                espSocket.send(
+                  JSON.stringify({
+                    type: "PLAY_YOUTUBE",
+                    mode: "story",
+                    candidates,
+                    sleepMinutes,
+                  })
+                );
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: {
+                    result: `Đang phát truyện "${candidates[0].title}" và hẹn giờ tự tắt sau ${sleepMinutes} phút.`,
+                  },
+                });
+              } else {
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: { result: `Không tìm thấy truyện ${query}.` },
+                });
+              }
+            } else if (call.name === "stop_media") {
+              espSocket.send(JSON.stringify({ type: "STOP_MEDIA" }));
+              functionResponses.push({
+                id: call.id,
+                name: call.name,
+                response: { result: "Đã dừng phát." },
+              });
+            }
+          }
+
+          geminiSocket.send(JSON.stringify({ toolResponse: { functionResponses } }));
+          return;
+        }
+
+        const parts = data?.serverContent?.modelTurn?.parts;
+        if (parts) {
+          for (const part of parts) {
+            if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
+              const binary = atob(part.inlineData.data);
+              const pcmBytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                pcmBytes[i] = binary.charCodeAt(i);
+              }
+              espSocket.send(pcmBytes.buffer);
+            }
+          }
+        }
+      } catch (err) {
+        espSocket.send("PARSE_ERR: " + err.message);
+      }
+    });
+
+    espSocket.addEventListener("close", () => geminiSocket.close());
+    geminiSocket.addEventListener("close", (e) => {
+      espSocket.close(e.code || 1000, e.reason || "Gemini closed");
+    });
+
+    return new Response(null, { status: 101, webSocket: client });
+  },
+};
