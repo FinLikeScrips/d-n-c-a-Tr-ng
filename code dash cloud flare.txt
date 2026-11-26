@@ -2,13 +2,14 @@ const HTML_PAGE = `<!DOCTYPE html>
 <html lang="vi">
 <head>
   <meta charset="UTF-8">
-  <title>Trợ lý ảo Gemini (Multi-Key + Keep-Alive)</title>
+  <title>Trợ lý ảo Gemini</title>
   <script src="https://www.youtube.com/iframe_api"></script>
 </head>
 <body style="font-family: sans-serif; padding: 20px; line-height: 1.6; max-width: 680px;">
-  <h3>Trợ lý ảo Gemini (Giá vàng + Nhạc YouTube + Truyện Audio)</h3>
+  <h3>Trợ lý ảo Gemini (Thời tiết + Tin tức + Wikipedia + Pomodoro + Nhạc & Truyện)</h3>
   <button id="startBtn">Bắt đầu nói chuyện</button>
-  <button id="stopBtn" disabled>Dừng tất cả</button>
+  <button id="stopBtn" disabled>Dừng</button>
+  <button id="clearMemBtn" style="margin-left: 8px;">Xóa nhớ tạm</button>
   <p id="status">Trạng thái: Chưa kết nối</p>
   <p>
     Âm lượng Mic: <progress id="vol" value="0" max="100"></progress> |
@@ -16,6 +17,18 @@ const HTML_PAGE = `<!DOCTYPE html>
     Ngưỡng lọc: <input id="threshSlider" type="range" min="0" max="15" value="2" />
     <span id="threshVal">0.02</span>
   </p>
+
+  <div id="pomoBox" style="margin: 12px 0; padding: 10px; background: #edf7ed; border: 1px solid #81c784; display: none;">
+    <b>Pomodoro:</b> <span id="pomoLabel"></span> —
+    <b id="pomoTime" style="font-size: 18px; color: #1b5e20;">00:00</b>
+    <span id="pomoPhase" style="margin-left: 8px; color: #388e3c;"></span>
+    <button id="stopPomoBtn" style="margin-left: 10px;">Tắt đồng hồ</button>
+  </div>
+
+  <div style="margin: 12px 0; padding: 10px; background: #fff9e6; border: 1px solid #f0d060; font-size: 13px;">
+    <b>Bộ nhớ tạm (15 phút, tối đa 6 mục):</b>
+    <ul id="memList" style="margin: 6px 0 0 18px; padding: 0;"><li>Chưa có ghi nhớ nào</li></ul>
+  </div>
 
   <div style="margin: 15px 0; padding: 12px; background: #eef6ff; border: 1px solid #99c2ff;">
     <b>Đang phát:</b> <span id="nowPlaying">Chưa phát</span>
@@ -31,19 +44,45 @@ const HTML_PAGE = `<!DOCTYPE html>
   <pre id="logBox" style="background:#f4f4f4; padding:10px; height:160px; overflow:auto; border:1px solid #ccc;"></pre>
 
   <script>
-    let ws, recCtx, playCtx, stream, processor;
-    let nextPlayTime = 0, lastVoiceTime = 0, lastPacketSentTime = 0, sleepTimer = null;
+    let ws, recCtx, playCtx, bellCtx, stream, processor;
+    let nextPlayTime = 0, lastVoiceTime = 0, sleepTimer = null;
     let silencePacketsLeft = 0;
-    let userStopped = true;
     let ytPlayer = null;
     let currentCandidates = [];
     let currentIdx = 0;
     let currentMode = "music";
+    let pomoInterval = null;
+    let pomoState = null;
+
+    const MEM_KEY = "ai_mini_temp_memory_v2";
+    const MEM_TTL = 15 * 60 * 1000;
+    const MEM_MAX = 6;
+    let tempMemory = [];
+
+    function pruneMemory() {
+      const now = Date.now();
+      tempMemory = (Array.isArray(tempMemory) ? tempMemory : [])
+        .filter(function (x) { return x && typeof x.t === "string" && x.e > now; })
+        .slice(-MEM_MAX);
+      try {
+        sessionStorage.setItem(MEM_KEY, JSON.stringify(tempMemory));
+      } catch (_) {}
+    }
+
+    try {
+      const saved = sessionStorage.getItem(MEM_KEY);
+      if (saved) tempMemory = JSON.parse(saved);
+    } catch (_) {
+      tempMemory = [];
+    }
+    pruneMemory();
 
     const statusEl = document.getElementById("status");
     const gateStatusEl = document.getElementById("gateStatus");
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
+    const clearMemBtn = document.getElementById("clearMemBtn");
+    const memListEl = document.getElementById("memList");
     const volEl = document.getElementById("vol");
     const threshSlider = document.getElementById("threshSlider");
     const threshVal = document.getElementById("threshVal");
@@ -53,11 +92,120 @@ const HTML_PAGE = `<!DOCTYPE html>
     const timerInfo = document.getElementById("timerInfo");
     const directLinkWrap = document.getElementById("directLinkWrap");
     const directLink = document.getElementById("directLink");
+    const pomoBox = document.getElementById("pomoBox");
+    const pomoLabel = document.getElementById("pomoLabel");
+    const pomoTime = document.getElementById("pomoTime");
+    const pomoPhase = document.getElementById("pomoPhase");
+    const stopPomoBtn = document.getElementById("stopPomoBtn");
+
+    function renderMemory() {
+      pruneMemory();
+      if (tempMemory.length === 0) {
+        memListEl.innerHTML = "<li>Chưa có ghi nhớ nào</li>";
+        return;
+      }
+      memListEl.innerHTML = tempMemory
+        .map(function (item) {
+          return "<li>" + item.t.replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</li>";
+        })
+        .join("");
+    }
+    renderMemory();
+
+    clearMemBtn.onclick = function () {
+      tempMemory = [];
+      sessionStorage.removeItem(MEM_KEY);
+      renderMemory();
+      addLog("🧹 Đã xóa bộ nhớ tạm.");
+    };
 
     function addLog(msg) {
       logBox.textContent += msg + "\\n";
       logBox.scrollTop = logBox.scrollHeight;
     }
+
+    function playBell() {
+      try {
+        const ctx = bellCtx && bellCtx.state !== "closed" ? bellCtx : new AudioContext();
+        bellCtx = ctx;
+        if (ctx.state === "suspended") ctx.resume();
+        const notes = [880, 1108.73, 1318.51];
+        const base = ctx.currentTime;
+        notes.forEach(function (freq, i) {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(freq, base + i * 0.22);
+          gain.gain.setValueAtTime(0.001, base + i * 0.22);
+          gain.gain.exponentialRampToValueAtTime(0.25, base + i * 0.22 + 0.03);
+          gain.gain.exponentialRampToValueAtTime(0.001, base + i * 0.22 + 0.35);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(base + i * 0.22);
+          osc.stop(base + i * 0.22 + 0.38);
+        });
+      } catch (_) {}
+    }
+
+    function formatMMSS(totalSec) {
+      const s = Math.max(0, Math.ceil(totalSec));
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return (m < 10 ? "0" : "") + m + ":" + (r < 10 ? "0" : "") + r;
+    }
+
+    function stopPomodoro(silent) {
+      if (pomoInterval) {
+        clearInterval(pomoInterval);
+        pomoInterval = null;
+      }
+      pomoState = null;
+      pomoBox.style.display = "none";
+      if (!silent) addLog("⏹ Đã tắt đồng hồ Pomodoro.");
+    }
+
+    function startPomodoro(workMin, breakMin, label) {
+      stopPomodoro(true);
+      const now = Date.now();
+      pomoState = {
+        label: label || "Học tập",
+        phase: "work",
+        endAt: now + workMin * 60 * 1000,
+        breakMin: breakMin
+      };
+      pomoLabel.textContent = pomoState.label;
+      pomoBox.style.display = "block";
+      addLog("⏱ Bắt đầu Pomodoro (" + pomoState.label + "): " + workMin + " phút" + (breakMin > 0 ? " / nghỉ " + breakMin + " phút" : "") + ".");
+
+      function tick() {
+        if (!pomoState) return;
+        const leftSec = (pomoState.endAt - Date.now()) / 1000;
+        if (leftSec > 0) {
+          pomoTime.textContent = formatMMSS(leftSec);
+          pomoPhase.textContent = pomoState.phase === "work" ? "(Đang tập trung)" : "(Đang nghỉ giải lao)";
+          return;
+        }
+        playBell();
+        if (pomoState.phase === "work" && pomoState.breakMin > 0) {
+          pomoState.phase = "break";
+          pomoState.endAt = Date.now() + pomoState.breakMin * 60 * 1000;
+          addLog("🔔 Hết giờ tập trung! Nghỉ giải lao " + pomoState.breakMin + " phút.");
+          pomoTime.textContent = formatMMSS(pomoState.breakMin * 60);
+          pomoPhase.textContent = "(Đang nghỉ giải lao)";
+        } else {
+          const doneLabel = pomoState.label;
+          stopPomodoro(true);
+          addLog("🔔 Hoàn thành phiên Pomodoro: " + doneLabel + "!");
+        }
+      }
+
+      tick();
+      pomoInterval = setInterval(tick, 500);
+    }
+
+    stopPomoBtn.onclick = function () {
+      stopPomodoro(false);
+    };
 
     function playCandidate(idx) {
       if (idx >= currentCandidates.length) {
@@ -90,7 +238,7 @@ const HTML_PAGE = `<!DOCTYPE html>
                 e.target.playVideo();
               },
               onError: function (e) {
-                addLog("⚠ Video lỗi/chặn nhúng (Mã " + e.data + "), đang tự đổi sang bản khác...");
+                addLog("⚠ Video lỗi/chặn nhúng (Mã " + e.data + "), đang đổi bản khác...");
                 playCandidate(currentIdx + 1);
               }
             }
@@ -121,25 +269,103 @@ const HTML_PAGE = `<!DOCTYPE html>
       threshVal.textContent = (threshSlider.value / 100).toFixed(2);
     };
 
-    function connectWebSocket() {
-      if (userStopped) return;
-      const wsUrl = location.origin.replace(/^http/, "ws") + "/";
+    startBtn.onclick = async function () {
+      logBox.textContent = "";
+      try {
+        recCtx = new AudioContext({ sampleRate: 16000 });
+        playCtx = new AudioContext({ sampleRate: 24000 });
+        if (!bellCtx || bellCtx.state === "closed") bellCtx = new AudioContext();
+        await recCtx.resume();
+        await playCtx.resume();
+        await bellCtx.resume();
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true },
+        });
+      } catch (err) {
+        statusEl.textContent = "Lỗi không mở được Micro: " + err.message;
+        return;
+      }
+
+      pruneMemory();
+      let wsUrl = location.origin.replace(/^http/, "ws") + "/";
+      if (tempMemory.length > 0) {
+        const texts = tempMemory.map(function (x) { return x.t; });
+        const encoded = encodeURIComponent(JSON.stringify(texts));
+        if (encoded.length < 1000) {
+          wsUrl += "?mem=" + encoded;
+        }
+      }
+
       ws = new WebSocket(wsUrl);
       ws.binaryType = "arraybuffer";
 
       ws.onopen = function () {
-        statusEl.textContent = "Đã kết nối! (Nhạc vẫn phát độc lập kể cả khi im lặng lâu)";
+        statusEl.textContent = "Đã kết nối! Thử hỏi: 'Thời tiết Hà Nội', 'Tin tức hôm nay', 'Định luật Newton là gì', 'Pomodoro 25 phút', hoặc 'Bật bài Origami'";
         startBtn.disabled = true;
         stopBtn.disabled = false;
         nextPlayTime = playCtx.currentTime;
         silencePacketsLeft = 0;
-        lastPacketSentTime = Date.now();
+
+        const source = recCtx.createMediaStreamSource(stream);
+        processor = recCtx.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = function (e) {
+          if (ws.readyState !== WebSocket.OPEN) return;
+          const float32 = e.inputBuffer.getChannelData(0);
+          let sum = 0;
+          for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+          const rms = Math.sqrt(sum / float32.length);
+          volEl.value = Math.min(100, Math.round(rms * 300));
+
+          const threshold = threshSlider.value / 100;
+          const now = Date.now();
+          if (threshold === 0 || rms >= threshold) {
+            lastVoiceTime = now;
+            silencePacketsLeft = 5;
+          }
+
+          if (threshold === 0 || now - lastVoiceTime <= 600) {
+            gateStatusEl.textContent = "Đang thu";
+            gateStatusEl.style.color = "green";
+            const int16 = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+              const s = Math.max(-1, Math.min(1, float32[i]));
+              int16[i] = s < 0 ? s * 32768 : s * 32767;
+            }
+            ws.send(int16.buffer);
+          } else if (silencePacketsLeft > 0) {
+            silencePacketsLeft--;
+            gateStatusEl.textContent = "Đang chờ bot...";
+            gateStatusEl.style.color = "#d9822b";
+            ws.send(new Int16Array(float32.length).buffer);
+          } else {
+            gateStatusEl.textContent = "Im lặng (Tiết kiệm quota)";
+            gateStatusEl.style.color = "gray";
+          }
+        };
+
+        source.connect(processor);
+        processor.connect(recCtx.destination);
       };
 
       ws.onmessage = function (event) {
         if (typeof event.data === "string") {
           try {
             const cmd = JSON.parse(event.data);
+            if (cmd.type === "SYNC_MEMORY" && Array.isArray(cmd.memory)) {
+              const exp = Date.now() + MEM_TTL;
+              tempMemory = cmd.memory.slice(-MEM_MAX).map(function (t) { return { t: t, e: exp }; });
+              renderMemory();
+              return;
+            }
+            if (cmd.type === "POMODORO") {
+              if (cmd.action === "stop") {
+                stopPomodoro(false);
+              } else {
+                startPomodoro(cmd.workMinutes || 25, cmd.breakMinutes ?? 5, cmd.label || "Học tập");
+              }
+              return;
+            }
             if (cmd.type === "PLAY_YOUTUBE") {
               if (sleepTimer) clearTimeout(sleepTimer);
               currentMode = cmd.mode || "music";
@@ -158,8 +384,14 @@ const HTML_PAGE = `<!DOCTYPE html>
               return;
             }
             if (cmd.type === "STOP_MEDIA") {
-              stopYouTube();
-              addLog("⏹ Đã tắt nhạc/truyện.");
+              const target = cmd.target || "all";
+              if (target === "all" || target === "media") {
+                stopYouTube();
+                addLog("⏹ Đã tắt nhạc/truyện.");
+              }
+              if (target === "all" || target === "pomodoro") {
+                stopPomodoro(false);
+              }
               return;
             }
           } catch (_) {}
@@ -184,87 +416,19 @@ const HTML_PAGE = `<!DOCTYPE html>
       };
 
       ws.onclose = function (e) {
-        if (!userStopped) {
-          statusEl.textContent = "Đang tự động làm mới phiên kết nối (Nhạc vẫn phát bình thường)...";
-          setTimeout(connectWebSocket, 1500);
-        } else {
-          statusEl.textContent = "Đã dừng kết nối.";
-        }
+        statusEl.textContent = "Đã ngắt kết nối (Code: " + e.code + ", Lý do: " + (e.reason || "Không rõ") + ") - Nhạc & Pomodoro vẫn giữ nguyên";
+        cleanup();
       };
-    }
-
-    startBtn.onclick = async function () {
-      logBox.textContent = "";
-      userStopped = false;
-      try {
-        recCtx = new AudioContext({ sampleRate: 16000 });
-        playCtx = new AudioContext({ sampleRate: 24000 });
-        await recCtx.resume();
-        await playCtx.resume();
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true },
-        });
-      } catch (err) {
-        statusEl.textContent = "Lỗi không mở được Micro: " + err.message;
-        return;
-      }
-
-      const source = recCtx.createMediaStreamSource(stream);
-      processor = recCtx.createScriptProcessor(4096, 1, 1);
-
-      processor.onaudioprocess = function (e) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const float32 = e.inputBuffer.getChannelData(0);
-        let sum = 0;
-        for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
-        const rms = Math.sqrt(sum / float32.length);
-        volEl.value = Math.min(100, Math.round(rms * 300));
-
-        const threshold = threshSlider.value / 100;
-        const now = Date.now();
-        if (threshold === 0 || rms >= threshold) {
-          lastVoiceTime = now;
-          silencePacketsLeft = 5;
-        }
-
-        if (threshold === 0 || now - lastVoiceTime <= 600) {
-          gateStatusEl.textContent = "Đang thu";
-          gateStatusEl.style.color = "green";
-          const int16 = new Int16Array(float32.length);
-          for (let i = 0; i < float32.length; i++) {
-            const s = Math.max(-1, Math.min(1, float32[i]));
-            int16[i] = s < 0 ? s * 32768 : s * 32767;
-          }
-          ws.send(int16.buffer);
-          lastPacketSentTime = now;
-        } else if (silencePacketsLeft > 0) {
-          silencePacketsLeft--;
-          gateStatusEl.textContent = "Đang chờ bot...";
-          gateStatusEl.style.color = "#d9822b";
-          ws.send(new Int16Array(float32.length).buffer);
-          lastPacketSentTime = now;
-        } else if (now - lastPacketSentTime >= 25000) {
-          // Cứ mỗi 25 giây im lặng, gửi 1 gói rỗng nhỏ để giữ kết nối không bị lỗi 1008 inactivity
-          ws.send(new Int16Array(1600).buffer);
-          lastPacketSentTime = now;
-          gateStatusEl.textContent = "Im lặng (Đã giữ kết nối)";
-          gateStatusEl.style.color = "gray";
-        } else {
-          gateStatusEl.textContent = "Im lặng (Tiết kiệm quota)";
-          gateStatusEl.style.color = "gray";
-        }
-      };
-
-      source.connect(processor);
-      processor.connect(recCtx.destination);
-
-      connectWebSocket();
     };
 
     stopBtn.onclick = function () {
-      userStopped = true;
       if (ws) ws.close();
       stopYouTube();
+      stopPomodoro(true);
+      cleanup();
+    };
+
+    function cleanup() {
       startBtn.disabled = false;
       stopBtn.disabled = true;
       volEl.value = 0;
@@ -272,17 +436,614 @@ const HTML_PAGE = `<!DOCTYPE html>
       if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
       if (recCtx && recCtx.state !== "closed") recCtx.close();
       if (playCtx && playCtx.state !== "closed") playCtx.close();
-    };
+    }
   </script>
 </body>
 </html>`;
+
+const TEXT_DECODER = new TextDecoder();
+const MEM_MAX_ITEMS = 6;
+const MEM_MAX_LEN = 100;
+const VN_ACCENT_RE = /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i;
+const FILLER_RE = /\b(lyric video|lyrics|official audio|official music video|mv|vietsub)\b/gi;
+const YT_JSON_RE = /"videoRenderer":\{"videoId":"([a-zA-Z0-9_-]{11})"[\s\S]{0,1200}?"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)+)"/g;
+const BING_YT_RE = /youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})/g;
+const RSS_ITEM_RE = /<item>[\s\S]*?<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>[\s\S]*?<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>[\s\S]*?<pubDate>([\s\S]*?)<\/pubDate>[\s\S]*?<\/item>/g;
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+const WIKI_UA = "AIMiniAssistant/1.0 (https://workers.dev)";
+
+const VN_CITIES = {
+  "ha noi": { name: "Hà Nội", lat: 21.0285, lon: 105.8542 },
+  "ho chi minh": { name: "TP. Hồ Chí Minh", lat: 10.8231, lon: 106.6297 },
+  "sai gon": { name: "TP. Hồ Chí Minh", lat: 10.8231, lon: 106.6297 },
+  "hcm": { name: "TP. Hồ Chí Minh", lat: 10.8231, lon: 106.6297 },
+  "da nang": { name: "Đà Nẵng", lat: 16.0544, lon: 108.2022 },
+  "hai phong": { name: "Hải Phòng", lat: 20.8449, lon: 106.6881 },
+  "can tho": { name: "Cần Thơ", lat: 10.0452, lon: 105.7469 },
+  "hue": { name: "Huế", lat: 16.4637, lon: 107.5909 },
+  "nha trang": { name: "Nha Trang", lat: 12.2388, lon: 109.1967 },
+  "da lat": { name: "Đà Lạt", lat: 11.9404, lon: 108.4583 },
+  "vung tau": { name: "Vũng Tàu", lat: 10.346, lon: 107.0843 },
+  "bien hoa": { name: "Biên Hòa", lat: 10.9574, lon: 106.8427 },
+  "vinh": { name: "Vinh", lat: 18.6796, lon: 105.6813 },
+  "quy nhon": { name: "Quy Nhơn", lat: 13.783, lon: 109.2197 },
+  "buon ma thuot": { name: "Buôn Ma Thuột", lat: 12.6667, lon: 108.05 },
+  "thai nguyen": { name: "Thái Nguyên", lat: 21.5942, lon: 105.8482 },
+  "bac ninh": { name: "Bắc Ninh", lat: 21.1861, lon: 106.0763 },
+  "ha long": { name: "Hạ Long", lat: 20.9599, lon: 107.0425 },
+  "nam dinh": { name: "Nam Định", lat: 20.4388, lon: 106.1621 },
+  "thanh hoa": { name: "Thanh Hóa", lat: 19.8067, lon: 105.7852 },
+  "hai duong": { name: "Hải Dương", lat: 20.9373, lon: 106.3146 },
+};
+
+const NEWS_FEEDS = {
+  "moi-nhat": "https://vnexpress.net/rss/tin-moi-nhat.rss",
+  "the-gioi": "https://vnexpress.net/rss/the-gioi.rss",
+  "cong-nghe": "https://vnexpress.net/rss/khoa-hoc-cong-nghe.rss",
+  "khoa-hoc": "https://vnexpress.net/rss/khoa-hoc-cong-nghe.rss",
+  "the-thao": "https://vnexpress.net/rss/the-thao.rss",
+  "giao-duc": "https://vnexpress.net/rss/giao-duc.rss",
+  "kinh-doanh": "https://vnexpress.net/rss/kinh-doanh.rss",
+  "giai-tri": "https://vnexpress.net/rss/giai-tri.rss",
+};
+
+const TOOL_DECLARATIONS = [
+  {
+    functionDeclarations: [
+      {
+        name: "save_temp_memory",
+        description: "Lưu ghi chú ngắn vào bộ nhớ tạm 15 phút (tên người dùng, sở thích, gu nhạc, lời dặn).",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            note: {
+              type: "STRING",
+              description: "Nội dung ngắn gọn cần nhớ (tối đa 1 câu).",
+            },
+          },
+          required: ["note"],
+        },
+      },
+      {
+        name: "get_weather",
+        description: "Xem thời tiết hiện tại và dự báo trong ngày tại một thành phố hoặc địa điểm.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            location: {
+              type: "STRING",
+              description: "Tên thành phố hoặc tỉnh (VD: 'Hà Nội', 'TP Hồ Chí Minh', 'Đà Nẵng', 'Tokyo').",
+            },
+          },
+          required: ["location"],
+        },
+      },
+      {
+        name: "set_pomodoro",
+        description: "Bật hoặc tắt đồng hồ Pomodoro / hẹn giờ học tập và nghỉ giải lao.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            action: {
+              type: "STRING",
+              description: "'start' để bắt đầu, 'stop' để dừng đồng hồ Pomodoro.",
+            },
+            work_minutes: {
+              type: "NUMBER",
+              description: "Số phút học/làm việc (mặc định 25).",
+            },
+            break_minutes: {
+              type: "NUMBER",
+              description: "Số phút nghỉ giải lao sau đó (mặc định 5, đặt 0 nếu chỉ hẹn giờ đơn).",
+            },
+            label: {
+              type: "STRING",
+              description: "Nhãn ngắn cho phiên học (VD: 'Học Toán', 'Ôn bài').",
+            },
+          },
+        },
+      },
+      {
+        name: "search_wikipedia",
+        description: "Tra cứu kiến thức bách khoa, khái niệm khoa học, lịch sử, nhân vật trên Wikipedia.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            keyword: {
+              type: "STRING",
+              description: "Từ khóa chính ngắn gọn (VD: 'Định luật Newton', 'Albert Einstein', 'Quang hợp'), không viết cả câu hỏi.",
+            },
+            language: {
+              type: "STRING",
+              description: "'vi' (mặc định) hoặc 'en'.",
+            },
+          },
+          required: ["keyword"],
+        },
+      },
+      {
+        name: "get_news",
+        description: "Lấy tin tức thời sự mới nhất từ VnExpress kèm ngày tháng giờ xảy ra.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            topic: {
+              type: "STRING",
+              description: "Chủ đề: 'moi-nhat', 'the-gioi', 'cong-nghe', 'khoa-hoc', 'the-thao', 'giao-duc', 'kinh-doanh', 'giai-tri'.",
+            },
+            count: {
+              type: "NUMBER",
+              description: "Số lượng tin muốn đọc (1 đến 5, mặc định 3).",
+            },
+          },
+        },
+      },
+      {
+        name: "play_youtube_music",
+        description: "Tìm và phát bài hát trên YouTube (nhạc tiếng Anh/quốc tế và nhạc Việt).",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: {
+              type: "STRING",
+              description: "Tên bài hát + tên ca sĩ (giữ nguyên tiếng Anh nếu là nhạc nước ngoài).",
+            },
+            language: {
+              type: "STRING",
+              description: "'en' cho nhạc tiếng Anh/quốc tế, 'vi' cho nhạc Việt, 'other' cho ngôn ngữ khác.",
+            },
+            is_random_mood: {
+              type: "BOOLEAN",
+              description: "true nếu người dùng nói tâm trạng/ngẫu nhiên, false nếu gọi đúng tên bài.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "play_audio_story",
+        description: "Tìm và phát truyện audio dài hoặc sách nói trên YouTube, có hẹn giờ tắt.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: {
+              type: "STRING",
+              description: "Tên truyện hoặc tác giả + 'truyện audio full'.",
+            },
+            sleep_minutes: {
+              type: "NUMBER",
+              description: "Số phút tự tắt (mặc định 45).",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "stop_media",
+        description: "Dừng nhạc, truyện audio hoặc đồng hồ Pomodoro đang chạy.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            target: {
+              type: "STRING",
+              description: "'media' để tắt nhạc/truyện, 'pomodoro' để tắt đồng hồ, 'all' để tắt tất cả.",
+            },
+          },
+        },
+      },
+    ],
+  },
+];
+
+function bytesToBase64(bytes) {
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+  let binary = "";
+  const chunk = 4096;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+  if (typeof Uint8Array["fromBase64"] === "function") return Uint8Array["fromBase64"](b64);
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function safeSend(socket, data) {
+  try {
+    if (socket.readyState === 1) socket.send(data);
+  } catch (_) {}
+}
+
+function safeClose(socket, code, reason) {
+  try {
+    const validCode = code >= 1000 && code <= 4999 && code !== 1005 && code !== 1006 ? code : 1000;
+    socket.close(validCode, reason || "");
+  } catch (_) {}
+}
+
+function normalizeCityKey(str) {
+  return String(str || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/gi, "d")
+    .toLowerCase()
+    .replace(/\b(thanh pho|tp\.?|tinh)\b/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function describeWeatherCode(code) {
+  if (code === 0) return "trời quang";
+  if (code <= 3) return "ít mây đến nhiều mây";
+  if (code === 45 || code === 48) return "có sương mù";
+  if (code >= 51 && code <= 57) return "mưa phùn nhẹ";
+  if (code >= 61 && code <= 67) return "có mưa";
+  if (code >= 71 && code <= 77) return "có tuyết";
+  if (code >= 80 && code <= 82) return "mưa rào";
+  if (code >= 95) return "mưa dông";
+  return "thời tiết thay đổi";
+}
+
+function formatVnDateTime(dateInput) {
+  const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  if (Number.isNaN(d.getTime())) return String(dateInput || "");
+  const parts = new Intl.DateTimeFormat("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return `ngày ${map.day}/${map.month}/${map.year} lúc ${map.hour}:${map.minute}`;
+}
+
+function decodeHtml(str) {
+  return String(str || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchWeather(location) {
+  const rawLoc = String(location || "Hà Nội").trim() || "Hà Nội";
+  const key = normalizeCityKey(rawLoc);
+  let target = VN_CITIES[key];
+
+  if (!target) {
+    try {
+      const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(rawLoc)}&count=1&language=vi&format=json`;
+      const geoRes = await fetch(geoUrl, { signal: AbortSignal.timeout(2500), cf: { cacheTtl: 86400 } });
+      if (geoRes.ok) {
+        const geoData = await geoRes.json();
+        const first = geoData?.results?.[0];
+        if (first) {
+          target = {
+            name: first.country ? `${first.name} (${first.country})` : first.name,
+            lat: first.latitude,
+            lon: first.longitude,
+          };
+        }
+      }
+    } catch (_) {}
+  }
+
+  if (!target) {
+    return `Không tìm thấy địa điểm "${rawLoc}" để xem thời tiết.`;
+  }
+
+  try {
+    const wUrl = `https://api.open-meteo.com/v1/forecast?latitude=${target.lat}&longitude=${target.lon}&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1`;
+    const res = await fetch(wUrl, { signal: AbortSignal.timeout(2500), cf: { cacheTtl: 600 } });
+    if (!res.ok) return `Lỗi lấy dữ liệu thời tiết (HTTP ${res.status}).`;
+    const data = await res.json();
+    const cur = data.current || {};
+    const day = data.daily || {};
+    const desc = describeWeatherCode(cur.weather_code);
+    const minT = day.temperature_2m_min?.[0];
+    const maxT = day.temperature_2m_max?.[0];
+    const rainP = day.precipitation_probability_max?.[0];
+    return `Thời tiết ${target.name} (${formatVnDateTime(new Date())}): ${desc}, nhiệt độ hiện tại ${cur.temperature_2m}°C (cảm giác ${cur.apparent_temperature}°C), độ ẩm ${cur.relative_humidity_2m}%, gió ${cur.wind_speed_10m} km/h. Hôm nay thấp nhất ${minT}°C, cao nhất ${maxT}°C, khả năng mưa ${rainP}%.`;
+  } catch (e) {
+    return `Không thể kết nối máy chủ thời tiết lúc này (${e.message}).`;
+  }
+}
+
+async function fetchWikiInLang(keyword, lang) {
+  const searchUrl = `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(keyword)}&srlimit=2&format=json&utf8=1`;
+  const sRes = await fetch(searchUrl, {
+    headers: { "User-Agent": WIKI_UA },
+    signal: AbortSignal.timeout(2500),
+    cf: { cacheTtl: 1800 },
+  });
+  if (!sRes.ok) return null;
+  const sData = await sRes.json();
+  const hits = sData?.query?.search || [];
+  for (const hit of hits) {
+    const sumUrl = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(hit.title)}`;
+    const sumRes = await fetch(sumUrl, {
+      headers: { "User-Agent": WIKI_UA },
+      signal: AbortSignal.timeout(2500),
+      cf: { cacheTtl: 1800 },
+    });
+    if (!sumRes.ok) continue;
+    const sum = await sumRes.json();
+    if (sum?.extract && sum.type !== "disambiguation") {
+      let text = sum.extract.replace(/\s+/g, " ").trim();
+      if (text.length > 450) {
+        const cut = text.slice(0, 450);
+        const lastDot = cut.lastIndexOf(".");
+        text = lastDot > 200 ? cut.slice(0, lastDot + 1) : cut + "...";
+      }
+      return { title: sum.title || hit.title, extract: text, lang };
+    }
+  }
+  return null;
+}
+
+async function fetchWikipedia(keyword, language) {
+  const cleanKw = String(keyword || "").trim().slice(0, 120);
+  if (!cleanKw) return "Thiếu từ khóa tra cứu Wikipedia.";
+  const primary = language === "en" ? "en" : "vi";
+  const secondary = primary === "vi" ? "en" : "vi";
+
+  try {
+    let result = await fetchWikiInLang(cleanKw, primary);
+    if (!result) result = await fetchWikiInLang(cleanKw, secondary);
+    if (result) {
+      return `Wikipedia (${result.lang}) - ${result.title}: ${result.extract}`;
+    }
+  } catch (_) {}
+
+  return `Không tìm thấy bài viết Wikipedia rõ ràng cho từ khóa "${cleanKw}".`;
+}
+
+async function fetchVietnamNews(topic, count) {
+  const key = NEWS_FEEDS[topic] ? topic : "moi-nhat";
+  const limit = Math.max(1, Math.min(5, Number(count) || 3));
+  const feedUrl = NEWS_FEEDS[key];
+
+  try {
+    const res = await fetch(feedUrl, {
+      headers: { "User-Agent": UA },
+      signal: AbortSignal.timeout(2500),
+      cf: { cacheTtl: 300 },
+    });
+    if (!res.ok) return `Không lấy được tin tức (HTTP ${res.status}).`;
+    const xml = (await res.text()).slice(0, 28000);
+    const items = [];
+    RSS_ITEM_RE.lastIndex = 0;
+    let m;
+    while ((m = RSS_ITEM_RE.exec(xml)) !== null && items.length < limit) {
+      const title = decodeHtml(m[1]);
+      let desc = decodeHtml(m[2]);
+      if (desc.length > 110) {
+        const cut = desc.slice(0, 110);
+        const lastSpace = cut.lastIndexOf(" ");
+        desc = (lastSpace > 60 ? cut.slice(0, lastSpace) : cut) + "...";
+      }
+      const dateStr = formatVnDateTime(m[3].trim());
+      items.push(`${items.length + 1}. [${dateStr}] ${title}${desc ? " - " + desc : ""}`);
+    }
+    if (items.length > 0) {
+      return `Tin tức VnExpress (${key}), cập nhật ${formatVnDateTime(new Date())}. Khi đọc cho người dùng BẮT BUỘC nêu rõ ngày tháng xảy ra của từng tin:\n${items.join("\n")}`;
+    }
+  } catch (e) {
+    return `Lỗi kết nối nguồn tin tức (${e.message}).`;
+  }
+  return "Hiện không đọc được danh sách tin tức mới nhất.";
+}
+
+function extractVideosFromText(rawText) {
+  const sample = rawText.length > 220000 ? rawText.slice(0, 220000) : rawText;
+  const list = [];
+  const seen = new Set();
+  YT_JSON_RE.lastIndex = 0;
+  let match;
+  while ((match = YT_JSON_RE.exec(sample)) !== null && list.length < 6) {
+    if (seen.has(match[1])) continue;
+    seen.add(match[1]);
+    const title = match[2]
+      .replace(/\\u0026/g, "&")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+    list.push({ videoId: match[1], title });
+  }
+  return list;
+}
+
+async function fetchYouTubeRaw(searchQ, isLongStory, isEnglish, env, logFn) {
+  const errors = [];
+  const t0 = Date.now();
+
+  const wrap = (name, fn) =>
+    fn()
+      .then((items) => {
+        if (items && items.length > 0) return { source: name, items };
+        errors.push(`${name}:empty`);
+        throw new Error(`${name}:empty`);
+      })
+      .catch((e) => {
+        if (!errors.some((x) => x.startsWith(name + ":"))) {
+          errors.push(`${name}:${e.message || "err"}`);
+        }
+        throw e;
+      });
+
+  const lightTasks = [];
+
+  if (env.YOUTUBE_API_KEY) {
+    lightTasks.push(
+      wrap("YT_API", async () => {
+        const durationParam = isLongStory ? "&videoDuration=long" : "";
+        const langParam = isEnglish ? "&relevanceLanguage=en" : "&relevanceLanguage=vi";
+        const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=6${durationParam}${langParam}&q=${encodeURIComponent(searchQ)}&key=${env.YOUTUBE_API_KEY}`;
+        const res = await fetch(apiUrl, { signal: AbortSignal.timeout(2200), cf: { cacheTtl: 300 } });
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json();
+        return (data.items || [])
+          .filter((it) => it?.id?.videoId)
+          .map((it) => ({ videoId: it.id.videoId, title: it.snippet.title }));
+      })
+    );
+  }
+
+  lightTasks.push(
+    wrap("Piped", async () => {
+      const pipedUrl = `https://api.piped.private.coffee/search?q=${encodeURIComponent(searchQ)}&filter=videos`;
+      const res = await fetch(pipedUrl, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(2200),
+        cf: { cacheTtl: 300 },
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      const out = [];
+      for (const it of data?.items || []) {
+        const m = String(it?.url || "").match(/v=([a-zA-Z0-9_-]{11})/);
+        if (m && it?.title) out.push({ videoId: m[1], title: String(it.title) });
+        if (out.length >= 6) break;
+      }
+      return out;
+    })
+  );
+
+  try {
+    const winner = await Promise.any(lightTasks);
+    logFn(`LOG: ⚡ Tìm thấy (${winner.source}, ${Date.now() - t0}ms)`);
+    return winner.items;
+  } catch (_) {}
+
+  const fallbackTasks = [
+    wrap("Innertube", async () => {
+      const res = await fetch("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": UA },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: "WEB",
+              clientVersion: "2.20250501.00.00",
+              hl: isEnglish ? "en" : "vi",
+              gl: isEnglish ? "US" : "VN",
+            },
+          },
+          query: searchQ,
+        }),
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      return extractVideosFromText(await res.text());
+    }),
+    wrap("Bing", async () => {
+      const bingUrl = `https://www.bing.com/videos/search?q=${encodeURIComponent(searchQ + " youtube")}`;
+      const res = await fetch(bingUrl, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(2500),
+        cf: { cacheTtl: 300 },
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const html = await res.text();
+      const seen = new Set();
+      const out = [];
+      BING_YT_RE.lastIndex = 0;
+      let m;
+      while ((m = BING_YT_RE.exec(html)) !== null && out.length < 5) {
+        if (seen.has(m[1])) continue;
+        seen.add(m[1]);
+        out.push({ videoId: m[1], title: searchQ });
+      }
+      return out;
+    }),
+  ];
+
+  try {
+    const winner = await Promise.any(fallbackTasks);
+    logFn(`LOG: ⚡ Tìm thấy (${winner.source}, ${Date.now() - t0}ms)`);
+    return winner.items;
+  } catch (_) {}
+
+  if (errors.length > 0) {
+    logFn("LOG: ⚠ Lỗi tìm YouTube: " + errors.join(" | "));
+  }
+  return [];
+}
+
+async function searchYouTubeCandidates(query, isLongStory, shuffle, language, env, logFn) {
+  const cleanQ = isLongStory
+    ? `${query} audio full`
+    : query.replace(FILLER_RE, "").replace(/\s+/g, " ").trim() || query;
+  const isEnglish = language === "en" || (language === "auto" && !VN_ACCENT_RE.test(cleanQ) && !isLongStory);
+
+  let candidates = await fetchYouTubeRaw(cleanQ, isLongStory, isEnglish, env, logFn);
+
+  if (!isLongStory && candidates.length > 1) {
+    const qLower = cleanQ.toLowerCase();
+    const scoreItem = (item) => {
+      const t = item.title.toLowerCase();
+      let score = 0;
+      if (t.includes("official audio") || t.includes("lyric") || t.includes("official music video")) score += 3;
+      if (t.includes("#shorts") || t.includes("reaction") || t.includes("1 hour")) score -= 5;
+      if (t.includes("karaoke") && !qLower.includes("karaoke")) score -= 5;
+      if (isEnglish && (t.includes("vietsub") || t.includes("cover")) && !qLower.includes("vietsub") && !qLower.includes("cover")) {
+        score -= 4;
+      }
+      return score;
+    };
+    candidates.sort((a, b) => scoreItem(b) - scoreItem(a));
+  }
+
+  candidates = candidates.slice(0, 5);
+
+  if (shuffle && candidates.length > 1) {
+    const firstIdx = Math.floor(Math.random() * candidates.length);
+    const [picked] = candidates.splice(firstIdx, 1);
+    candidates.unshift(picked);
+  }
+  return candidates;
+}
 
 export default {
   async fetch(request, env) {
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response(HTML_PAGE, {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "public, max-age=300",
+        },
       });
+    }
+
+    const url = new URL(request.url);
+    let sessionMemory = [];
+    try {
+      const memParam = url.searchParams.get("mem");
+      if (memParam) {
+        const parsed = JSON.parse(memParam);
+        if (Array.isArray(parsed)) {
+          sessionMemory = parsed
+            .filter((x) => typeof x === "string" && x.trim().length > 0)
+            .map((x) => x.trim().slice(0, MEM_MAX_LEN))
+            .slice(-MEM_MAX_ITEMS);
+        }
+      }
+    } catch (_) {
+      sessionMemory = [];
     }
 
     const pair = new WebSocketPair();
@@ -293,41 +1054,42 @@ export default {
       .split(",")
       .map((k) => k.trim())
       .filter(Boolean);
-
-    for (let i = keys.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [keys[i], keys[j]] = [keys[j], keys[i]];
+    const activeKey = keys[Math.floor(Math.random() * keys.length)];
+    if (!activeKey) {
+      safeClose(espSocket, 1011, "Missing GEMINI_API_KEY");
+      return new Response(null, { status: 101, webSocket: client });
     }
 
-    const MODEL = env.GEMINI_MODEL || "models/gemini-3.8-live";
-    let geminiSocket = null;
-    let usedKeyIndex = -1;
-
-    for (let i = 0; i < keys.length; i++) {
-      const tryUrl = `https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${keys[i]}`;
-      try {
-        const geminiResp = await fetch(tryUrl, {
-          headers: { Upgrade: "websocket" },
-        });
-        if (geminiResp.webSocket) {
-          geminiSocket = geminiResp.webSocket;
-          usedKeyIndex = i + 1;
-          break;
-        }
-      } catch (_) {}
-    }
-
+    const model = env.GEMINI_MODEL || "models/gemini-3.8-live";
+    const geminiUrl = `https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${activeKey}`;
+    const geminiResp = await fetch(geminiUrl, { headers: { Upgrade: "websocket" } });
+    const geminiSocket = geminiResp.webSocket;
     if (!geminiSocket) {
-      espSocket.close(1011, "All API keys exhausted or failed");
+      safeClose(espSocket, 1011, "Cannot connect to Gemini");
       return new Response(null, { status: 101, webSocket: client });
     }
     geminiSocket.accept();
-    espSocket.send(`LOG: 🔑 Đã kết nối bằng API Key #${usedKeyIndex}/${keys.length}`);
 
-    geminiSocket.send(
+    function pushTempMemory(note) {
+      const clean = String(note || "").trim().slice(0, MEM_MAX_LEN);
+      if (!clean) return;
+      if (!sessionMemory.includes(clean)) {
+        sessionMemory.push(clean);
+        if (sessionMemory.length > MEM_MAX_ITEMS) sessionMemory.shift();
+      }
+      safeSend(espSocket, JSON.stringify({ type: "SYNC_MEMORY", memory: sessionMemory }));
+    }
+
+    const memoryBlock =
+      sessionMemory.length > 0
+        ? ` BỘ NHỚ TẠM (15 phút): ${sessionMemory.join(" ; ")}.`
+        : "";
+
+    safeSend(
+      geminiSocket,
       JSON.stringify({
         setup: {
-          model: MODEL,
+          model,
           generationConfig: {
             responseModalities: ["AUDIO"],
             speechConfig: {
@@ -338,165 +1100,24 @@ export default {
             parts: [
               {
                 text:
-                  "Bạn là trợ lý ảo thông minh chạy trên ESP32, trả lời ngắn gọn, tự nhiên bằng tiếng Việt. " +
-                  "1. Khi người dùng hỏi giá vàng hôm nay, giá vàng SJC hay vàng nhẫn 9999 -> BẮT BUỘC gọi công cụ get_gold_price, không tự nói là không truy cập được. " +
-                  "2. Khi người dùng muốn nghe nhạc: KHÔNG tìm từ khóa chung chung. Tự chọn TÊN BÀI HÁT CỤ THỂ + CA SĨ hợp tâm trạng, luôn thêm chữ 'lyric video' vào cuối từ khóa rồi gọi play_youtube_music. Nếu đòi đổi bài, chọn bài khác hẳn. " +
-                  "3. Khi muốn nghe truyện audio dài, truyện ma, kiếm hiệp, sách nói -> gọi play_audio_story. " +
-                  "4. Khi muốn tắt nhạc/truyện -> gọi stop_media.",
+                  `Bạn là trợ lý ảo chạy trên ESP32, trả lời ngắn gọn, tự nhiên bằng tiếng Việt.${memoryBlock} ` +
+                  "1. BỘ NHỚ TẠM: Khi người dùng nói tên, sở thích, gu nhạc hoặc dặn nhớ điều gì -> gọi save_temp_memory. " +
+                  "2. THỜI TIẾT: Hỏi thời tiết, nhiệt độ, trời có mưa không -> gọi get_weather. " +
+                  "3. POMODORO / HẸN GIỜ HỌC: Yêu cầu bật/tắt Pomodoro hoặc hẹn giờ học/nghỉ -> gọi set_pomodoro. " +
+                  "4. WIKIPEDIA: Hỏi kiến thức khoa học, lịch sử, khái niệm, nhân vật -> gọi search_wikipedia với từ khóa ngắn gọn. " +
+                  "5. TIN TỨC: Hỏi tin tức, thời sự, có gì mới hôm nay -> gọi get_news và BẮT BUỘC đọc rõ ngày tháng xảy ra của từng tin. " +
+                  "6. TÌM NHẠC (play_youtube_music): Nhạc tiếng Anh/quốc tế giữ nguyên '<Song> <Artist>' tiếng Anh chuẩn, không dịch, đặt language='en'. Nhạc Việt đặt language='vi'. Đổi bài thì tránh bài đã phát trong Bộ nhớ tạm. " +
+                  "7. Nghe truyện audio dài, truyện ma, sách nói -> gọi play_audio_story. " +
+                  "8. Tắt nhạc, truyện hoặc đồng hồ Pomodoro -> gọi stop_media.",
               },
             ],
           },
-          tools: [
-            {
-              functionDeclarations: [
-                {
-                  name: "get_gold_price",
-                  description: "Lấy trực tiếp giá vàng SJC và vàng nhẫn 9999 hôm nay tại Việt Nam theo giờ Việt Nam.",
-                  parameters: { type: "OBJECT", properties: {} },
-                },
-                {
-                  name: "play_youtube_music",
-                  description: "Tìm và phát một bài hát cụ thể trên YouTube.",
-                  parameters: {
-                    type: "OBJECT",
-                    properties: {
-                      query: {
-                        type: "STRING",
-                        description: "Tên bài hát cụ thể + ca sĩ + 'lyric video'.",
-                      },
-                      is_random_mood: {
-                        type: "BOOLEAN",
-                        description: "true nếu người dùng chỉ nói tâm trạng/ngẫu nhiên, false nếu gọi đúng tên bài.",
-                      },
-                    },
-                    required: ["query"],
-                  },
-                },
-                {
-                  name: "play_audio_story",
-                  description: "Tìm và phát truyện audio dài hoặc sách nói trên YouTube, có hẹn giờ tắt.",
-                  parameters: {
-                    type: "OBJECT",
-                    properties: {
-                      query: {
-                        type: "STRING",
-                        description: "Tên truyện cụ thể hoặc tác giả + 'truyện audio full'.",
-                      },
-                      sleep_minutes: {
-                        type: "NUMBER",
-                        description: "Số phút tự tắt (mặc định 45).",
-                      },
-                    },
-                    required: ["query"],
-                  },
-                },
-                {
-                  name: "stop_media",
-                  description: "Dừng nhạc hoặc truyện audio đang phát.",
-                  parameters: { type: "OBJECT", properties: {} },
-                },
-              ],
-            },
-          ],
+          tools: TOOL_DECLARATIONS,
         },
       })
     );
 
-    const decoder = new TextDecoder();
-
-    async function fetchVietnamGoldPrice() {
-      const vnTime = new Date().toLocaleString("vi-VN", {
-        timeZone: "Asia/Ho_Chi_Minh",
-        hour12: false,
-      });
-
-      try {
-        const res = await fetch("https://sjc.com.vn/xml/tygiavang.xml", {
-          headers: { "User-Agent": "Mozilla/5.0" },
-          signal: AbortSignal.timeout(4500),
-          cf: { cacheTtl: 180 },
-        });
-        if (res.ok) {
-          const xml = await res.text();
-          const items = [];
-          const regex = /<item\s+buy="([^"]+)"\s+sell="([^"]+)"\s+type="([^"]+)"/g;
-          let m;
-          while ((m = regex.exec(xml)) !== null) {
-            const [, buy, sell, type] = m;
-            if (
-              type.includes("SJC 1L") ||
-              type.includes("Nhẫn SJC 99,99") ||
-              type.includes("Vàng miếng SJC")
-            ) {
-              items.push(`${type}: mua vào ${buy} triệu/lượng, bán ra ${sell} triệu/lượng`);
-            }
-            if (items.length >= 2) break;
-          }
-          if (items.length > 0) {
-            return `Giờ Việt Nam: ${vnTime}. Giá vàng SJC cập nhật: ${items.join("; ")}.`;
-          }
-        }
-      } catch (_) {}
-
-      try {
-        const res = await fetch("https://giavang.org/", {
-          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-          signal: AbortSignal.timeout(4500),
-          cf: { cacheTtl: 180 },
-        });
-        if (res.ok) {
-          const html = await res.text();
-          const sjcMatch = html.match(/SJC[\s\S]{0,400}?(\d{2,3}\.\d{3})[\s\S]{0,150}?(\d{2,3}\.\d{3})/);
-          if (sjcMatch) {
-            return `Giờ Việt Nam: ${vnTime}. Giá vàng SJC tham khảo: mua vào ${sjcMatch[1]} triệu/lượng, bán ra ${sjcMatch[2]} triệu/lượng.`;
-          }
-        }
-      } catch (_) {}
-
-      return `Hiện tại là ${vnTime} giờ Việt Nam. Tạm thời nguồn bảng giá vàng trực tuyến đang bảo trì.`;
-    }
-
-    async function searchYouTubeCandidates(query, isLongStory = false, shuffle = false) {
-      const searchQ = isLongStory ? `${query} audio full` : query;
-      let candidates = [];
-
-      if (env.YOUTUBE_API_KEY) {
-        const durationParam = isLongStory ? "&videoDuration=long" : "";
-        const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=5${durationParam}&q=${encodeURIComponent(searchQ)}&key=${env.YOUTUBE_API_KEY}`;
-        const res = await fetch(apiUrl);
-        const data = await res.json();
-        candidates = (data.items || []).map((it) => ({
-          videoId: it.id.videoId,
-          title: it.snippet.title,
-        }));
-      } else {
-        const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchQ)}`;
-        const res = await fetch(ytUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": "vi-VN,vi;q=0.9",
-          },
-        });
-        const html = await res.text();
-        const regex = /"videoRenderer":\{"videoId":"([a-zA-Z0-9_-]{11})".*?"title":\{"runs":\[\{"text":"([^"]+)"/g;
-        const seen = new Set();
-        let match;
-        while ((match = regex.exec(html)) !== null && candidates.length < 5) {
-          if (seen.has(match[1])) continue;
-          seen.add(match[1]);
-          const title = match[2].replace(/\\u0026/g, "&").replace(/\\"/g, '"');
-          candidates.push({ videoId: match[1], title });
-        }
-      }
-
-      if (shuffle && candidates.length > 1) {
-        const firstIdx = Math.floor(Math.random() * candidates.length);
-        const [picked] = candidates.splice(firstIdx, 1);
-        candidates.unshift(picked);
-      }
-      return candidates;
-    }
+    const logFn = (msg) => safeSend(espSocket, msg);
 
     espSocket.addEventListener("message", async (event) => {
       let arrayBuffer = null;
@@ -505,19 +1126,14 @@ export default {
       } else if (event.data instanceof Blob) {
         arrayBuffer = await event.data.arrayBuffer();
       }
-
       if (arrayBuffer && arrayBuffer.byteLength > 0) {
-        const bytes = new Uint8Array(arrayBuffer);
-        let binary = "";
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        geminiSocket.send(
+        safeSend(
+          geminiSocket,
           JSON.stringify({
             realtimeInput: {
               audio: {
                 mimeType: "audio/pcm;rate=16000",
-                data: btoa(binary),
+                data: bytesToBase64(new Uint8Array(arrayBuffer)),
               },
             },
           })
@@ -528,12 +1144,14 @@ export default {
     geminiSocket.addEventListener("message", async (event) => {
       try {
         let text;
-        if (event.data instanceof Blob) {
-          text = await event.data.text();
-        } else if (event.data instanceof ArrayBuffer) {
-          text = decoder.decode(event.data);
-        } else {
+        if (typeof event.data === "string") {
           text = event.data;
+        } else if (event.data instanceof ArrayBuffer) {
+          text = TEXT_DECODER.decode(event.data);
+        } else if (event.data instanceof Blob) {
+          text = await event.data.text();
+        } else {
+          return;
         }
 
         const data = JSON.parse(text);
@@ -542,20 +1160,85 @@ export default {
           const functionResponses = [];
 
           for (const call of data.toolCall.functionCalls) {
-            if (call.name === "get_gold_price") {
-              const info = await fetchVietnamGoldPrice();
-              espSocket.send("LOG: " + info);
+            if (call.name === "save_temp_memory") {
+              const note = call.args?.note || "";
+              pushTempMemory(note);
+              logFn("LOG: 🧠 Đã nhớ tạm: " + note);
+              functionResponses.push({
+                id: call.id,
+                name: call.name,
+                response: { result: `Đã lưu: "${note}".` },
+              });
+            } else if (call.name === "get_weather") {
+              const loc = call.args?.location || "Hà Nội";
+              logFn(`LOG: 🌤 Xem thời tiết: ${loc}`);
+              const info = await fetchWeather(loc);
+              logFn("LOG: " + info);
+              functionResponses.push({
+                id: call.id,
+                name: call.name,
+                response: { result: info },
+              });
+            } else if (call.name === "set_pomodoro") {
+              const action = call.args?.action === "stop" ? "stop" : "start";
+              const workMin = Math.max(1, Math.min(180, Number(call.args?.work_minutes) || 25));
+              const rawBreak = call.args?.break_minutes;
+              const breakMin =
+                rawBreak === undefined || rawBreak === null || rawBreak === ""
+                  ? 5
+                  : Math.max(0, Math.min(60, Number(rawBreak) || 0));
+              const label = String(call.args?.label || "Học tập").trim().slice(0, 40);
+              safeSend(
+                espSocket,
+                JSON.stringify({
+                  type: "POMODORO",
+                  action,
+                  workMinutes: workMin,
+                  breakMinutes: breakMin,
+                  label,
+                })
+              );
+              const msg =
+                action === "stop"
+                  ? "Đã tắt đồng hồ Pomodoro."
+                  : `Đã bật đồng hồ Pomodoro (${label}): tập trung ${workMin} phút${breakMin > 0 ? `, nghỉ ${breakMin} phút` : ""}.`;
+              functionResponses.push({
+                id: call.id,
+                name: call.name,
+                response: { result: msg },
+              });
+            } else if (call.name === "search_wikipedia") {
+              const keyword = call.args?.keyword || "";
+              const language = call.args?.language || "vi";
+              logFn(`LOG: 📚 Tra Wikipedia [${language}]: ${keyword}`);
+              const info = await fetchWikipedia(keyword, language);
+              logFn("LOG: " + info.slice(0, 180) + (info.length > 180 ? "..." : ""));
+              functionResponses.push({
+                id: call.id,
+                name: call.name,
+                response: { result: info },
+              });
+            } else if (call.name === "get_news") {
+              const topic = call.args?.topic || "moi-nhat";
+              const count = Number(call.args?.count) || 3;
+              logFn(`LOG: 📰 Đọc tin tức [${topic}] (${count} tin)`);
+              const info = await fetchVietnamNews(topic, count);
+              logFn("LOG: " + info);
               functionResponses.push({
                 id: call.id,
                 name: call.name,
                 response: { result: info },
               });
             } else if (call.name === "play_youtube_music") {
-              const query = call.args?.query || "Lofi chill Việt Nam lyric video";
+              const query = call.args?.query || "Ed Sheeran Shape of You";
+              const language = call.args?.language || "auto";
               const isRandom = Boolean(call.args?.is_random_mood);
-              const candidates = await searchYouTubeCandidates(query, false, isRandom);
+              logFn(`LOG: 🎵 Tìm nhạc [${language}]: ${query}`);
+              const candidates = await searchYouTubeCandidates(query, false, isRandom, language, env, logFn);
               if (candidates.length > 0) {
-                espSocket.send(
+                pushTempMemory(`Đã phát: ${candidates[0].title}`);
+                safeSend(
+                  espSocket,
                   JSON.stringify({
                     type: "PLAY_YOUTUBE",
                     mode: "music",
@@ -567,22 +1250,24 @@ export default {
                   id: call.id,
                   name: call.name,
                   response: {
-                    result: `Đang phát trên YouTube: "${candidates[0].title}". Giới thiệu ngắn tên bài này cho người dùng.`,
+                    result: `Đang phát: "${candidates[0].title}". Giới thiệu ngắn gọn.`,
                   },
                 });
               } else {
                 functionResponses.push({
                   id: call.id,
                   name: call.name,
-                  response: { result: `Không tìm thấy bài hát phù hợp cho ${query}.` },
+                  response: { result: `Không tìm thấy bài hát cho ${query}.` },
                 });
               }
             } else if (call.name === "play_audio_story") {
               const query = call.args?.query || "truyện ma Nguyễn Ngọc Ngạn";
               const sleepMinutes = Number(call.args?.sleep_minutes) || 45;
-              const candidates = await searchYouTubeCandidates(query, true, false);
+              const candidates = await searchYouTubeCandidates(query, true, false, "vi", env, logFn);
               if (candidates.length > 0) {
-                espSocket.send(
+                pushTempMemory(`Đã phát truyện: ${candidates[0].title}`);
+                safeSend(
+                  espSocket,
                   JSON.stringify({
                     type: "PLAY_YOUTUBE",
                     mode: "story",
@@ -594,7 +1279,7 @@ export default {
                   id: call.id,
                   name: call.name,
                   response: {
-                    result: `Đang phát truyện "${candidates[0].title}" và hẹn giờ tự tắt sau ${sleepMinutes} phút.`,
+                    result: `Đang phát truyện "${candidates[0].title}", tự tắt sau ${sleepMinutes} phút.`,
                   },
                 });
               } else {
@@ -605,7 +1290,8 @@ export default {
                 });
               }
             } else if (call.name === "stop_media") {
-              espSocket.send(JSON.stringify({ type: "STOP_MEDIA" }));
+              const target = call.args?.target || "all";
+              safeSend(espSocket, JSON.stringify({ type: "STOP_MEDIA", target }));
               functionResponses.push({
                 id: call.id,
                 name: call.name,
@@ -614,7 +1300,7 @@ export default {
             }
           }
 
-          geminiSocket.send(JSON.stringify({ toolResponse: { functionResponses } }));
+          safeSend(geminiSocket, JSON.stringify({ toolResponse: { functionResponses } }));
           return;
         }
 
@@ -622,24 +1308,17 @@ export default {
         if (parts) {
           for (const part of parts) {
             if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
-              const binary = atob(part.inlineData.data);
-              const pcmBytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) {
-                pcmBytes[i] = binary.charCodeAt(i);
-              }
-              espSocket.send(pcmBytes.buffer);
+              safeSend(espSocket, base64ToBytes(part.inlineData.data).buffer);
             }
           }
         }
       } catch (err) {
-        espSocket.send("PARSE_ERR: " + err.message);
+        logFn("PARSE_ERR: " + err.message);
       }
     });
 
-    espSocket.addEventListener("close", () => geminiSocket.close());
-    geminiSocket.addEventListener("close", (e) => {
-      espSocket.close(e.code || 1000, e.reason || "Gemini closed");
-    });
+    espSocket.addEventListener("close", () => safeClose(geminiSocket, 1000, "Client closed"));
+    geminiSocket.addEventListener("close", (e) => safeClose(espSocket, e.code, e.reason || "Gemini closed"));
 
     return new Response(null, { status: 101, webSocket: client });
   },
